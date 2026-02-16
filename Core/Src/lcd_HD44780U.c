@@ -16,6 +16,23 @@ static const uint8_t FIRST_LINE_END_ADDRESS_IN_DDRAM = 0x27; //0x00 + 40 = 0x27 
 static const uint8_t SECOND_LINE_START_ADDRESS_IN_DDRAM = 0x40;
 static const uint8_t SECOND_LINE_END_ADDRESS_IN_DDRAM = 0x67; //0x40 + 40 = 0x67 (both lines are 40 chars long)
 
+static void DWT_Init(void)
+{
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk; //Enable debug trace
+	DWT->CYCCNT = 0; //Reset the cycle counter
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk; //Enable the cycle counter
+}
+
+static void DWT_delay_us(uint32_t delay)
+{
+	uint32_t start = DWT->CYCCNT;
+	uint32_t cpuCyclesPerMicrosecond = HAL_RCC_GetHCLKFreq() / 1000000;
+	uint32_t requiredCycles = delay * cpuCyclesPerMicrosecond;
+
+	//Wait until enough cycles has passed
+	while ((DWT->CYCCNT - start) < requiredCycles) { }
+}
+
 //For input, pass GPIO_MODE_INPUT. For output, pass GPIO_MODE_OUTPUT_PP.
 static void ChangeGPIOPortModes(uint32_t mode)
 {
@@ -37,10 +54,22 @@ static void ChangeGPIOPortModes(uint32_t mode)
 //want to check for the busy flag, you need to set RS=low RW=high before calling this function.
 static uint8_t ReadLCDMemory_Internal()
 {
+	//Do NOT wait until busy flag turns off here. In order to read the busy flag, this function needs to
+	//be called. If this function checks for busy flag as well, we have infinite recursion and eventual
+	//stack overflow.
+
 	ChangeGPIOPortModes(GPIO_MODE_INPUT);
 
-	HAL_GPIO_WritePin(Pin_EN_GPIO_Port, Pin_EN_Pin, GPIO_PIN_SET);
+	//Here RS and RW are already set. Before enable pin is used, tAS time needs to pass.
+	//In case the caller didn't do it, add the delay here.
+	uint32_t tAS = 1; //This is 40 ns minimum. We have a resolution of us, so wait 1 us.
+	DWT_delay_us(tAS);
 
+	HAL_GPIO_WritePin(Pin_EN_GPIO_Port, Pin_EN_Pin, GPIO_PIN_SET);
+	uint32_t tDDR = 1; //This is 160 ns (max). Since we have 1 us precision, wait for 1 us.
+	DWT_delay_us(tDDR); //Wait until data becomes valid.
+	//NOTE: The enable signal also needs to stay high for at least PWeh = 230 ns. Since we are
+	//waiting 1 us, it includes this delay as well so we don't need to bother with it.
 	uint8_t value = 0;
 	value |= HAL_GPIO_ReadPin(Pin_D7_GPIO_Port, Pin_D7_Pin) << 7;
 	value |= HAL_GPIO_ReadPin(Pin_D6_GPIO_Port, Pin_D6_Pin) << 6;
@@ -52,7 +81,13 @@ static uint8_t ReadLCDMemory_Internal()
 	value |= HAL_GPIO_ReadPin(Pin_D0_GPIO_Port, Pin_D0_Pin) << 0;
 
 	HAL_GPIO_WritePin(Pin_EN_GPIO_Port, Pin_EN_Pin, GPIO_PIN_RESET);
-
+	//After enable is set low, the data/address is held for tDHR and tAH respectively. The minimum values of
+	//these are 5ns min and 10ns min. Waiting a whole microsecond is very wasteful, so just wait 100 clock
+	//cycles with NOP.
+	for (int i = 0; i < 100; i++)
+	{
+		__NOP();
+	}
 	ChangeGPIOPortModes(GPIO_MODE_OUTPUT_PP);
 
 	return value;
@@ -73,9 +108,25 @@ void SendInstruction(uint16_t instruction)
 	{
 		HAL_GPIO_WritePin(ports[i], pins[i], (instruction >> ((arr_size(pins) - 1) - i)) & 0x1);
 	}
+	//After RS and RW are set to desired values, tAS = 40 ns min needs to pass before enable pin is set HIGH.
+	//Our resolution is in us, so wait 1 us.
+	uint32_t tAS = 1;
+	DWT_delay_us(tAS);
+
 	//Toggle enable pin
 	HAL_GPIO_WritePin(Pin_EN_GPIO_Port, Pin_EN_Pin, GPIO_PIN_SET);
+	//After enable pin is set HIGH, tDSW = 80 ns min needs to pass.
+	//Our resolution is in microseconds, so wait 1 us.
+	uint32_t tDSW = 1;
+	DWT_delay_us(tDSW);
 	HAL_GPIO_WritePin(Pin_EN_GPIO_Port, Pin_EN_Pin, GPIO_PIN_RESET);
+	//After enable pin is set LOW, both the address and the data lines are held by the chip
+	//for tAH and tH respectively, both of them are 10 ns min. Waiting 1 microsecond is very wasteful, so
+	//just wait for 100 clock cycles using NOP.
+	for (int i = 0; i < 100; i++)
+	{
+		__NOP();
+	}
 }
 
 void Init16x2LCD()
@@ -93,6 +144,11 @@ void Init16x2LCD()
 	//If this function isn't called when the system is starting, this delay won't be necessary. But
 	//just to make sure this function works no matter where it is called from, introduce a delay anyways.
 	HAL_Delay(12);
+
+	//Enable this before sending any instructions because instruction sending
+	//relies on microsecond delays, for which DWT needs to be enabled.
+	DWT_Init();
+
 	FunctionSet(1, 1, 0);
 	DisplayAndCursorControl(1, 0, 0);
 	EntryModeSet(1, 0);
@@ -239,6 +295,15 @@ void SendByte(uint8_t byte)
 	uint16_t instruction = 0b1000000000;
 	instruction |= byte;
 	SendInstruction(instruction);
+
+	/*
+	  This function is writing data to CGRAM or DDRAM. This internally updates the RAM address counter.
+	  The update happens tADD us after the busy flag turns off. Wait for the busy flag to turn off and
+	  wait for tADD us so that address counter becomes valid for future instructions.
+	*/
+	while (IsBusy()) {}
+	uint32_t tADD = 4;
+	DWT_delay_us(tADD);
 }
 
 void WriteCharacter(uint8_t character)
@@ -248,7 +313,8 @@ void WriteCharacter(uint8_t character)
 
 void WriteString(const char* text)
 {
-	for (size_t i = 0; i < strlen(text); i++)
+	size_t len = strlen(text);
+	for (size_t i = 0; i < len; i++)
 	{
 		WriteCharacter(text[i]);
 	}
@@ -285,6 +351,11 @@ uint8_t ReadAddressCounter()
 	HAL_GPIO_WritePin(Pin_RS_GPIO_Port, Pin_RS_Pin, GPIO_PIN_RESET);
 	HAL_GPIO_WritePin(Pin_RW_GPIO_Port, Pin_RW_Pin, GPIO_PIN_SET);
 
+	//Wait until the busy flag turns off
+	while (IsBusy()) {}
+	uint32_t tADD = 4; //Address counter becomes valid tADD us after the busy flag turns off
+	DWT_delay_us(tADD);
+
 	uint8_t data = ReadLCDMemory_Internal();
 	return data & 0x7F; //All bits except the highest one make up the address
 }
@@ -294,5 +365,11 @@ uint8_t ReadByte()
 	//Notify the chip we want to read the RAM
 	HAL_GPIO_WritePin(Pin_RS_GPIO_Port, Pin_RS_Pin, GPIO_PIN_SET);
 	HAL_GPIO_WritePin(Pin_RW_GPIO_Port, Pin_RW_Pin, GPIO_PIN_SET);
+
+	//Wait until the busy flag turns off
+	while (IsBusy()) {}
+	uint32_t tADD = 4; //Address counter becomes valid tADD us after the busy flag turns off
+	DWT_delay_us(tADD);
+
 	return ReadLCDMemory_Internal();
 }
