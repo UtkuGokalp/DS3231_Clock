@@ -51,7 +51,7 @@ The project was developed with modularity in mind and has multiple layers. This 
      - Using `st-flash` for STM32F103 (Blue Pill)
 
 ## 📸 Demo
-Photos and demonstration video will be added soon.
+A short demo video can be found [here](https://youtu.be/_m3KHYBiCEk).
 
 ## 🔮 Future Improvements
  - Improve LCD firmware to ensure full compliance with HD44780U timing requirements
